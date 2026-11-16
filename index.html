@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Jarvis">
+<meta name="theme-color" content="#060606">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.json">
+<title>Jarvis</title>
+<script>
+// ============================================================
+//  Jarvis fürs iPhone (Web-App). Ersetzt den Android-Teil:
+//  Verschlüsselung (AES-256 + HMAC, gleich wie PC), Verbindung über ntfy.sh,
+//  Spracherkennung und Stimme vom iPhone. Der Schlüssel kommt per QR-Code vom PC.
+// ============================================================
+(function () {
+  const SERVER = 'https://ntfy.sh/';
+  const te = new TextEncoder(), td = new TextDecoder();
+  const q = s => document.querySelector(s);
+  let KEY = null, aesKey = null, macKey = null, cmdTopic = '', repTopic = '', es = null;
+  const seen = new Set();
+
+  // ---------- Schlüssel aus dem QR-Code (#k=...) oder gespeichert ----------
+  function b64urlToBytes(s) { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+  function bytesToB64(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+  function b64ToBytes(s) { return Uint8Array.from(atob(s.trim()), c => c.charCodeAt(0)); }
+  function cat(...a) { const n = a.reduce((x, y) => x + y.length, 0), r = new Uint8Array(n); let o = 0; a.forEach(x => { r.set(x, o); o += x.length; }); return r; }
+  async function sha(b) { return new Uint8Array(await crypto.subtle.digest('SHA-256', b)); }
+  const hex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+
+  function readKey() {
+    const m = location.hash.match(/k=([A-Za-z0-9_\-]+)/);
+    if (m) { try { localStorage.setItem('jarvis-key', m[1]); } catch (e) {} return m[1]; }
+    try { return localStorage.getItem('jarvis-key'); } catch (e) { return null; }
+  }
+
+  async function setup(k) {
+    KEY = b64urlToBytes(k);
+    if (KEY.length !== 32) throw new Error('Schlüssel ungültig');
+    const d = async l => sha(cat(KEY, te.encode(l)));
+    cmdTopic = 'jv' + hex((await d('topic-cmd')).slice(0, 20));
+    repTopic = 'jv' + hex((await d('topic-rep')).slice(0, 20));
+    aesKey = await crypto.subtle.importKey('raw', await d('enc'), 'AES-CBC', false, ['encrypt', 'decrypt']);
+    macKey = await crypto.subtle.importKey('raw', await d('mac'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  }
+
+  async function encrypt(str) {
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv }, aesKey, te.encode(str)));
+    const body = cat(iv, ct);
+    const tag = new Uint8Array(await crypto.subtle.sign('HMAC', macKey, body));
+    return bytesToB64(cat(body, tag));
+  }
+  async function decryptBytes(all) {
+    if (all.length < 64) return null;
+    const body = all.slice(0, all.length - 32), tag = all.slice(all.length - 32);
+    if (!(await crypto.subtle.verify('HMAC', macKey, tag, body))) return null;      // nicht von deinem PC
+    try { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: body.slice(0, 16) }, aesKey, body.slice(16))); }
+    catch (e) { return null; }
+  }
+  const call = (fn, ...a) => { try { if (window[fn]) window[fn](...a); } catch (e) {} };
+
+  // ---------- Senden / Empfangen ----------
+  async function send(type, text) {
+    if (!KEY) return;
+    const msg = JSON.stringify({ t: type, x: text, ts: Date.now(), id: crypto.getRandomValues(new Uint32Array(4)).join('') });
+    const body = await encrypt(msg);
+    for (let i = 0; i < 3; i++) {
+      try { const r = await fetch(SERVER + cmdTopic, { method: 'POST', body }); if (r.ok) return; } catch (e) {}
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    call('onJarvisStatus', 'offline');
+  }
+
+  function listen() {
+    if (!KEY) return;
+    if (es) es.close();
+    es = new EventSource(SERVER + repTopic + '/sse?since=' + (Math.floor(Date.now() / 1000) - 5));
+    es.onopen = () => call('onJarvisStatus', 'online');
+    es.onerror = () => call('onJarvisStatus', 'offline');
+    es.onmessage = async ev => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.event !== 'message' || !m.message) return;
+      const pt = await decryptBytes(b64ToBytes(m.message)); if (!pt) return;
+      const plain = td.decode(pt); let e; try { e = JSON.parse(plain); } catch (x) { return; }
+      if (Math.abs(Date.now() - (e.ts || 0)) > 120000) return;    // zu alt
+      if (seen.has(e.id)) return; seen.add(e.id);
+      if (e.t === 'image' && m.attachment) {
+        call('onJarvisImageLoading');
+        try {
+          const buf = new Uint8Array(await (await fetch(m.attachment.url)).arrayBuffer());
+          const img = await decryptBytes(buf); if (!img) return;
+          call('onJarvisImage', URL.createObjectURL(new Blob([img], { type: 'image/jpeg' })), e.x);
+        } catch (x) { call('onJarvisImageError'); }
+        return;
+      }
+      call('onJarvisEvent', plain);
+    };
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && KEY) listen(); });
+
+  // ---------- Spracherkennung (iPhone) ----------
+  let rec = null;
+  function startListening() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { call('jarvisVoiceError'); call('onJarvisListen', 'error'); return; }
+    stopSpeak();
+    rec = new SR(); rec.lang = 'de-DE'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+    let final = '';
+    rec.onstart = () => call('onJarvisListen', 'start');
+    rec.onresult = ev => {
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        if (ev.results[i].isFinal) final += ev.results[i][0].transcript; else interim += ev.results[i][0].transcript;
+      }
+      call('onJarvisPartial', final || interim);
+      call('onJarvisLevel', 6);
+    };
+    rec.onerror = ev => call('onJarvisListen', ev.error === 'not-allowed' ? 'denied' : 'error');
+    rec.onend = () => { call('onJarvisListen', 'end'); call('onJarvisHeard', final.trim()); };
+    try { rec.start(); } catch (e) { call('onJarvisListen', 'error'); }
+  }
+
+  // ---------- Stimme (iPhone) ----------
+  let voices = [], voiceIdx = -1;
+  function loadVoices() {
+    voices = (speechSynthesis.getVoices() || []).filter(v => v.lang && v.lang.toLowerCase().startsWith('de'));
+    const saved = localStorage.getItem('jarvis-voice');
+    voiceIdx = voices.findIndex(v => v.name === saved);
+    if (voiceIdx < 0) voiceIdx = Math.max(0, voices.findIndex(v => /martin|yannick|markus|viktor/i.test(v.name)));
+  }
+  if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+  function speak(text) {
+    if (!window.speechSynthesis) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text); u.lang = 'de-DE'; u.pitch = 0.85; u.rate = 1.0;
+    if (voices[voiceIdx]) u.voice = voices[voiceIdx];
+    u.onstart = () => call('onJarvisSpeaking', true);
+    u.onend = () => call('onJarvisSpeaking', false);
+    u.onerror = () => call('onJarvisSpeaking', false);
+    speechSynthesis.speak(u);
+  }
+  function stopSpeak() { try { speechSynthesis.cancel(); } catch (e) {} }
+
+  // ---------- Brücke wie in der Android-App ----------
+  window.JarvisNative = {
+    send: (t, x) => { send(t, x); },
+    listen: () => startListening(),
+    stopListen: () => { try { rec && rec.stop(); } catch (e) {} },
+    speak: t => speak(t),
+    stopSpeak: () => stopSpeak(),
+    nextVoice: () => {
+      if (!voices.length) return 'Keine deutschen Stimmen gefunden.';
+      voiceIdx = (voiceIdx + 1) % voices.length; localStorage.setItem('jarvis-voice', voices[voiceIdx].name);
+      speak('So klinge ich jetzt.'); return 'Stimme: ' + voices[voiceIdx].name;
+    },
+    wake: () => call('onJarvisWake', false),
+    vibrate: () => {},
+    unpair: () => { try { localStorage.removeItem('jarvis-key'); } catch (e) {} location.hash = ''; location.reload(); }
+  };
+
+  // ---------- Start ----------
+  document.addEventListener('DOMContentLoaded', async () => {
+    // "PC an" gibt es auf dem iPhone nicht (Apple erlaubt das im Browser nicht)
+    const on = q('#pcOn'); if (on) on.style.display = 'none';
+    const pcs = q('.pcs'); if (pcs) pcs.style.gridTemplateColumns = 'repeat(3, 1fr)';
+    const hint = q('.hint'); if (hint) hint.textContent = 'Lange auf den Kreis drücken: Stimme wechseln · Lange auf „Jarvis“: neu koppeln';
+    const k = readKey();
+    if (!k) { showPair(); return; }
+    try { await setup(k); } catch (e) { showPair('Der QR-Code war ungültig. Bitte neu scannen.'); return; }
+    listen();
+    setTimeout(() => send('ping', ''), 300);
+  });
+
+  function showPair(err) {
+    const d = document.createElement('div');
+    d.style.cssText = 'position:fixed;inset:0;background:#060606;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;color:#ececec;font-family:inherit';
+    d.innerHTML = '<div style="font-size:30px;font-weight:600;margin-bottom:12px">Jarvis</div>' +
+      '<div style="color:#888;font-size:15px;line-height:1.5;max-width:300px"></div>';
+    d.lastChild.textContent = err || 'Am PC "iPhone koppeln" doppelklicken und den QR-Code mit der Kamera scannen. Danach in Safari: Teilen → "Zum Home-Bildschirm".';
+    document.body.appendChild(d);
+  }
+})();
+
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<style>
+  :root { --bg:#060606; --card:#0f0f0f; --line:#1b1b1b; --dim:#666; --fg:#ececec; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:15px/1.45 Roboto, system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  button { font-family:inherit; }
+
+  header { padding:calc(16px + env(safe-area-inset-top)) 20px 4px; display:flex; align-items:center; justify-content:space-between; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand b { font-size:17px; font-weight:600; color:#fff; letter-spacing:.3px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#333; }
+  .dot.on { background:#e8e8e8; } .dot.off { background:#ff5c5c; } .dot.busy { background:#fff; animation:blink .9s infinite; }
+  @keyframes blink { 50% { opacity:.25 } }
+  .tabs { display:flex; gap:18px; }
+  .tabs button { border:0; background:none; color:#555; font-size:14px; font-weight:500; padding:6px 0; border-bottom:1.5px solid transparent; }
+  .tabs button.act { color:#fff; border-color:#fff; }
+  #status { color:var(--dim); font-size:12px; padding:2px 20px 0; height:18px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+
+  .view { flex:1; overflow-y:auto; padding:0 20px 20px; }
+  .hidden { display:none !important; }
+
+  /* --- Steuern --- */
+  .time { text-align:center; margin-top:14px; }
+  #clock { font-size:46px; font-weight:200; letter-spacing:-1px; color:#f2f2f2; line-height:1.1; }
+  #date { color:#4d4d4d; font-size:10px; letter-spacing:.34em; margin-top:4px; }
+
+  .orbWrap { display:flex; flex-direction:column; align-items:center; margin:26px 0 8px; }
+  .orb { position:relative; width:168px; height:168px; border-radius:50%; border:0; background:none; padding:0; }
+  .orb .ring, .orb .core { position:absolute; border-radius:50%; left:50%; top:50%; transform:translate(-50%,-50%); }
+  .orb .r1 { width:168px; height:168px; border:1px solid rgba(255,255,255,.08); }
+  .orb .r2 { width:136px; height:136px; border:1px solid rgba(255,255,255,.16); animation:breath 4s ease-in-out infinite; }
+  .orb .core { width:100px; height:100px; background:radial-gradient(circle at 50% 40%, #1e1e1e, #0b0b0b 70%); border:1px solid rgba(255,255,255,.35);
+    display:flex; align-items:center; justify-content:center; color:#eaeaea; transition:background .25s, color .25s, width .08s, height .08s; }
+  .orb .core svg { width:26px; height:26px; }
+  @keyframes breath { 50% { transform:translate(-50%,-50%) scale(1.06); opacity:.6 } }
+  .orb.listen .core { background:#f2f2f2; color:#0a0a0a; border-color:#f2f2f2; }
+  .orb.listen .r2 { animation:none; border-color:rgba(255,255,255,.45); }
+  .orb.think .r2 { animation:spin 1.6s linear infinite; border-style:dashed; border-color:rgba(255,255,255,.4); }
+  .orb.speak .r1 { animation:wave 1.3s ease-out infinite; } .orb.speak .r2 { animation:wave 1.3s ease-out .35s infinite; }
+  @keyframes spin { to { transform:translate(-50%,-50%) rotate(360deg) } }
+  @keyframes wave { 0% { transform:translate(-50%,-50%) scale(.8); opacity:.9 } 100% { transform:translate(-50%,-50%) scale(1.15); opacity:0 } }
+  #caption { margin-top:14px; min-height:44px; max-width:300px; text-align:center; color:#9a9a9a; font-size:14px; line-height:1.45; }
+  #caption.live { color:#f2f2f2; }
+
+  h3 { font-size:10.5px; font-weight:500; color:#4f4f4f; letter-spacing:.24em; margin:24px 2px 10px; }
+  .acts { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .act { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:14px 14px 12px; text-align:left; color:var(--fg); transition:all .2s; }
+  .act b { display:block; font-size:15px; font-weight:500; }
+  .act small { display:block; color:#5a5a5a; font-size:11.5px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .act .sw { float:right; width:30px; height:17px; border-radius:9px; background:#262626; position:relative; margin-top:2px; transition:background .2s; }
+  .act .sw::after { content:''; position:absolute; left:3px; top:3px; width:11px; height:11px; border-radius:50%; background:#777; transition:all .2s; }
+  .act.on { background:#f2f2f2; color:#0a0a0a; border-color:#f2f2f2; } .act.on small { color:#555; }
+  .act.on .sw { background:#0a0a0a; } .act.on .sw::after { left:16px; background:#f2f2f2; }
+  .act.wait { opacity:.55; }
+  .act:active, .pcb:active, .orb:active { transform:scale(.96); }
+
+  .pcs { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; }
+  .pcb { font-size:11.5px !important; }
+  /* Bildschirmfoto */
+  .shot { margin:4px 34px 14px 0; border-radius:14px; overflow:hidden; border:1px solid #222; animation:in .3s ease-out; }
+  .shot img { display:block; width:100%; }
+  .shot small { display:block; padding:8px 12px; color:#777; font-size:11.5px; background:#0e0e0e; }
+  #viewer { position:fixed; inset:0; background:rgba(0,0,0,.96); display:none; flex-direction:column; z-index:10; }
+  #viewer.show { display:flex; }
+  #viewer .bar { display:flex; justify-content:space-between; align-items:center; padding:16px 18px; color:#bbb; font-size:13px; }
+  #viewer .bar button { background:#1a1a1a; border:1px solid #2a2a2a; color:#eee; border-radius:12px; padding:8px 14px; font-size:13px; }
+  #viewer .img { flex:1; overflow:auto; display:flex; align-items:center; }
+  #viewer img { width:100%; }
+  #viewer .img.zoom img { width:220%; }
+  .pcb { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:14px 6px 12px; color:#dcdcdc; display:flex; flex-direction:column; align-items:center; gap:8px; font-size:12px; transition:transform .12s; }
+  .pcb svg { width:21px; height:21px; }
+  .pcb { transition:transform .12s, background .2s, border-color .2s, color .2s; }
+  .pcb.arm[data-tint="on"]   { background:#0e2414; border-color:#2f7a45; color:#bff2cd; }
+  .pcb.arm[data-tint="lock"] { background:#1d1d1d; border-color:#8a8a8a; color:#fff; }
+  .pcb.arm[data-tint="off"]  { background:#2a1010; border-color:#a33a3a; color:#ffd0d0; }
+  .pcb.arm { animation:armPulse 1s ease-in-out infinite; }
+  @keyframes armPulse { 50% { filter:brightness(1.35) } }
+  .hint { text-align:center; color:#3f3f3f; font-size:11px; margin-top:22px; }
+
+  /* --- Chat --- */
+  #empty { text-align:center; color:#444; font-size:13px; margin-top:45%; }
+  .u { margin:14px 0 10px auto; max-width:82%; width:fit-content; background:#1a1a1a; color:#f2f2f2; padding:10px 16px; border-radius:20px 20px 6px 20px; animation:in .25s ease-out; }
+  .j { margin:4px 34px 14px 0; color:#e2e2e2; white-space:pre-wrap; animation:in .3s ease-out; user-select:text; -webkit-user-select:text; }
+  .note { text-align:center; color:#555; font-size:12px; margin:10px 20px; }
+  .think { margin:6px 0 14px; } .think i { display:inline-block; width:5px; height:5px; border-radius:50%; background:#8a8a8a; margin-right:4px; animation:blink 1s infinite; }
+  .think i:nth-child(2) { animation-delay:.15s } .think i:nth-child(3) { animation-delay:.3s }
+  @keyframes in { from { opacity:0; transform:translateY(6px) } to { opacity:1; transform:none } }
+  .card { background:#0e0e0e; border:1px solid #2a2a2a; border-radius:18px; padding:16px; margin:6px 0 14px; animation:in .25s ease-out; }
+  .card p { margin:0 0 14px; }
+  .btn { border:0; border-radius:12px; padding:11px 20px; font-size:14px; font-weight:600; }
+  .yes { background:#f2f2f2; color:#0a0a0a; margin-right:8px; } .no { background:transparent; color:#dadada; border:1px solid #2e2e2e; }
+  .files { border:1px solid var(--line); border-radius:14px; padding:8px 12px; margin:0 34px 14px 0; font-size:12.5px; color:#bdbdbd; }
+  .files div { padding:6px 0; border-bottom:1px solid #161616; word-break:break-all; } .files div:last-child { border:0; }
+
+  footer { padding:6px 14px calc(14px + env(safe-area-inset-bottom)); }
+  .box { display:flex; align-items:flex-end; background:#111; border:1px solid #222; border-radius:28px; padding:6px 6px 6px 18px; }
+  textarea { flex:1; background:transparent; border:0; outline:0; color:#f2f2f2; font-size:16px; line-height:1.4; font-family:inherit; resize:none; padding:9px 0; max-height:120px; user-select:text; -webkit-user-select:text; }
+  textarea::placeholder { color:#4f4f4f; }
+  #send { width:40px; height:40px; border-radius:50%; border:0; background:#f2f2f2; color:#0a0a0a; flex:none; display:flex; align-items:center; justify-content:center; }
+  #send:disabled { background:#1f1f1f; color:#4f4f4f; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand"><b id="title">Jarvis</b><span class="dot" id="dot"></span></div>
+    <div class="tabs"><button id="tabCtl" class="act">Steuern</button><button id="tabChat">Chat</button></div>
+  </header>
+  <div id="status">Verbinde …</div>
+
+  <div class="view" id="vCtl">
+    <div class="time"><div id="clock">00:00</div><div id="date"></div></div>
+
+    <div class="orbWrap">
+      <button class="orb" id="orb" aria-label="Mit Jarvis sprechen">
+        <span class="ring r1"></span><span class="ring r2"></span>
+        <span class="core" id="core"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>
+      </button>
+      <div id="caption">Tippen und sprechen</div>
+    </div>
+
+    <h3>AKTIONEN</h3>
+    <div class="acts" id="acts"><div class="act wait"><b>Lädt …</b><small>vom PC</small></div></div>
+
+    <h3>PC</h3>
+    <div class="pcs">
+      <button class="pcb" id="pcOn" data-tint="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg><span>PC an</span></button>
+      <button class="pcb" id="pcLook"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span>Bildschirm</span></button>
+      <button class="pcb" id="pcLock" data-tint="lock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Sperren</span></button>
+      <button class="pcb" id="pcOff" data-tint="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M5 5l14 14M19 5 5 19"/></svg><span>Aus</span></button>
+    </div>
+    <div class="hint">Lange auf den Kreis drücken: Stimme wechseln</div>
+  </div>
+
+  <div class="view hidden" id="vChat">
+    <div id="empty">Schreib Jarvis, was er am PC machen soll.</div>
+    <div id="chat"></div>
+  </div>
+
+  <div id="viewer">
+    <div class="bar"><span id="vCap">Bildschirm</span><span><button id="vNew">Neu</button> <button id="vClose">Schließen</button></span></div>
+    <div class="img" id="vImg"><img id="vPic" alt="Bildschirmfoto vom PC"></div>
+  </div>
+
+  <footer id="foot" class="hidden">
+    <div class="box">
+      <textarea id="input" rows="1" placeholder="Nachricht an Jarvis …" enterkeyhint="send"></textarea>
+      <button id="send" disabled aria-label="Senden"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+    </div>
+  </footer>
+<script>
+const $ = id => document.getElementById(id);
+const N = window.JarvisNative || { send(){}, listen(){}, stopListen(){}, speak(){}, stopSpeak(){}, nextVoice(){ return ''; }, wake(){}, vibrate(){} };
+let thinkEl = null, pcName = '', pcTimer = null, view = 'ctl', viaVoice = false, awaitingConfirm = null, listening = false;
+let mac = ''; try { mac = localStorage.getItem('jarvis-mac') || ''; } catch (e) {}
+
+function haptic() { try { N.vibrate(); } catch (e) {} }
+function setStatus(t, cls) { $('status').textContent = t; $('dot').className = 'dot' + (cls ? ' ' + cls : ''); }
+function connected() { setStatus(pcName ? 'Verbunden mit ' + pcName : 'Verbunden', 'on'); }
+function caption(t, live) { $('caption').textContent = t; $('caption').classList.toggle('live', !!live); }
+function orb(state) { $('orb').className = 'orb' + (state ? ' ' + state : ''); if (state !== 'listen') { $('core').style.width = ''; $('core').style.height = ''; } }
+function show(v) {
+  view = v;
+  $('vCtl').classList.toggle('hidden', v !== 'ctl'); $('vChat').classList.toggle('hidden', v !== 'chat'); $('foot').classList.toggle('hidden', v !== 'chat');
+  $('tabCtl').classList.toggle('act', v === 'ctl'); $('tabChat').classList.toggle('act', v === 'chat');
+  if (v === 'chat') scrollDown();
+}
+$('tabCtl').onclick = () => show('ctl'); $('tabChat').onclick = () => show('chat');
+function scrollDown() { const m = $('vChat'); m.scrollTop = m.scrollHeight; }
+function add(cls, text) { $('empty').style.display = 'none'; const d = document.createElement('div'); d.className = cls; d.textContent = text; $('chat').appendChild(d); scrollDown(); return d; }
+function removeThink() { if (thinkEl) { thinkEl.remove(); thinkEl = null; } }
+
+function tick() {
+  const n = new Date();
+  $('clock').textContent = n.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  $('date').textContent = n.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' }).toUpperCase().replace(',', '  ·');
+}
+setInterval(tick, 1000); tick();
+
+// ---------- Aktionen ----------
+function renderActions(text) {
+  const box = $('acts'); box.innerHTML = '';
+  const lines = text.split('\n').filter(l => l.trim());
+  if (!lines.length) { box.innerHTML = '<div class="act wait"><b>Keine Aktionen</b><small>aktionen.txt am PC</small></div>'; return; }
+  lines.forEach(l => {
+    const [name, on, apps] = l.split('|');
+    const once = on === '-';                                // Einmal-Knopf (z.B. "Medal weg")
+    const b = document.createElement('button'); b.className = 'act' + (on === '1' ? ' on' : '');
+    b.innerHTML = (once ? '' : '<span class="sw"></span>') + '<b></b><small></small>';
+    b.querySelector('b').textContent = name;
+    b.querySelector('small').textContent = once ? 'Einmal tippen' : (apps || '');
+    b.onclick = () => {
+      haptic(); b.classList.add('wait');
+      if (!once) b.classList.toggle('on'); else setTimeout(() => b.classList.remove('wait'), 1500);
+      send('aktion ' + name, 'tile');
+    };
+    box.appendChild(b);
+  });
+}
+
+// ---------- vom Android-Teil ----------
+window.onJarvisStatus = s => { if (s === 'online' && !pcName) setStatus('Suche PC …', 'on'); else if (s === 'offline') setStatus('Keine Internetverbindung', 'off'); };
+window.onJarvisEvent = raw => {
+  let ev; try { ev = JSON.parse(raw); } catch (e) { return; }
+  if (ev.t === 'pong') {
+    const p = ev.x.split('|'); pcName = p[0]; if (p[1]) { mac = p[1]; try { localStorage.setItem('jarvis-mac', mac); } catch (e) {} }
+    clearTimeout(pcTimer); connected();
+  }
+  else if (ev.t === 'actions') renderActions(ev.x);
+  else if (ev.t === 'say') {
+    removeThink(); add('j', ev.x); connected();
+    if (view === 'ctl') caption(ev.x, false);
+    if (viaVoice) { N.speak(ev.x); } else orb('');
+  }
+  else if (ev.t === 'think') { removeThink(); thinkEl = add('think', ''); thinkEl.innerHTML = '<i></i><i></i><i></i>'; setStatus('Denkt nach …', 'busy'); orb('think'); if (view === 'ctl') caption('Denkt nach …'); }
+  else if (ev.t === 'done') { removeThink(); connected(); if (!viaVoice && !listening) orb(''); }
+  else if (ev.t === 'files') { const d = document.createElement('div'); d.className = 'files';
+    ev.x.split('\n').slice(0, 10).forEach(p => { const r = document.createElement('div'); r.textContent = p; d.appendChild(r); });
+    $('empty').style.display = 'none'; $('chat').appendChild(d); scrollDown(); }
+  else if (ev.t === 'confirm') confirmCard(ev.x);
+};
+function confirmCard(q) {
+  removeThink(); setStatus('Wartet auf dich', 'busy'); haptic();
+  const c = document.createElement('div'); c.className = 'card';
+  const p = document.createElement('p'); p.textContent = q; c.appendChild(p);
+  const y = document.createElement('button'); y.className = 'btn yes'; y.textContent = 'Ja, mach';
+  const n = document.createElement('button'); n.className = 'btn no'; n.textContent = 'Nein';
+  const done = a => { if (!y.isConnected) return; y.remove(); n.remove(); awaitingConfirm = null;
+    const s = document.createElement('div'); s.className = 'note'; s.style.margin = '0'; s.style.textAlign = 'left';
+    s.textContent = a ? 'Bestätigt' : 'Abgebrochen'; c.appendChild(s); N.send('answer', a ? 'ja' : 'nein'); caption(a ? 'Bestätigt.' : 'Abgebrochen.'); };
+  y.onclick = () => done(true); n.onclick = () => done(false);
+  c.appendChild(y); c.appendChild(n); $('empty').style.display = 'none'; $('chat').appendChild(c); scrollDown();
+  awaitingConfirm = done;
+  if (viaVoice) { caption(q + ' (Ja oder Nein?)', true); N.speak(q + ' Ja oder nein?'); }
+  else show('chat');
+}
+
+// ---------- Sprechen ----------
+$('orb').onclick = () => {
+  haptic();
+  if (listening) { N.stopListen(); return; }
+  N.stopSpeak(); listening = true; orb('listen'); caption('Ich höre …', true); N.listen();
+};
+let press;
+$('orb').addEventListener('touchstart', () => { press = setTimeout(() => { press = 'long'; haptic(); caption(N.nextVoice() || 'Stimme gewechselt'); }, 700); });
+$('orb').addEventListener('touchend', e => { if (press === 'long') { e.preventDefault(); press = null; } else clearTimeout(press); });
+
+window.onJarvisListen = s => {
+  if (s === 'start') { listening = true; orb('listen'); }
+  else if (s === 'error' || s === 'denied') { listening = false; orb(''); caption(s === 'denied' ? 'Ohne Mikrofon-Erlaubnis geht das nicht.' : 'Nichts verstanden. Nochmal tippen.'); }
+  else if (s === 'end') { orb('think'); }
+};
+window.onJarvisLevel = rms => { const s = 100 + Math.max(0, Math.min(10, rms)) * 4; $('core').style.width = s + 'px'; $('core').style.height = s + 'px'; };
+window.onJarvisPartial = t => caption(t, true);
+window.onJarvisHeard = t => {
+  listening = false;
+  if (!t) { orb(''); caption('Nichts verstanden. Nochmal tippen.'); return; }
+  caption('„' + t + '“', true);
+  if (awaitingConfirm) {
+    const s = t.toLowerCase();
+    if (/^(ja|jo|jap|klar|mach|okay|ok)\b/.test(s)) { awaitingConfirm(true); return; }
+    if (/^(nein|nee|stopp|abbrechen|lass)/.test(s)) { awaitingConfirm(false); return; }
+  }
+  send(t, 'voice');
+};
+window.onJarvisSpeaking = on => { if (on) orb('speak'); else if (!listening) { orb(''); if (awaitingConfirm && viaVoice) { listening = true; orb('listen'); N.listen(); } } };
+
+// ---------- PC an ----------
+// ---------- Bildschirm ansehen ----------
+let lastShotCmd = 'zeig bildschirm', wantViewer = false;
+$('pcLook').onclick = () => { haptic(); lastShotCmd = 'zeig bildschirm'; wantViewer = true; caption('Mache ein Foto vom Bildschirm …'); send('zeig bildschirm', 'tile'); };
+window.onJarvisImageLoading = () => { if (view === 'ctl') caption('Lade Bild …'); };
+window.onJarvisImageError = () => caption('Das Bild konnte nicht geladen werden.');
+window.onJarvisImage = (data, cap) => {
+  removeThink();
+  const d = document.createElement('div'); d.className = 'shot';
+  const im = document.createElement('img'); im.src = data; d.appendChild(im);
+  const s = document.createElement('small'); s.textContent = (cap || 'Bildschirm') + ' · ' + new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }); d.appendChild(s);
+  d.onclick = () => openViewer(data, cap);
+  $('empty').style.display = 'none'; $('chat').appendChild(d); scrollDown();
+  if (wantViewer) { openViewer(data, cap); wantViewer = false; } else if (view === 'ctl') caption('Foto ist im Chat.');
+  haptic(); connected();
+};
+function openViewer(data, cap) { $('vPic').src = data; $('vCap').textContent = cap || 'Bildschirm'; $('vImg').classList.remove('zoom'); $('viewer').classList.add('show'); }
+$('vClose').onclick = () => $('viewer').classList.remove('show');
+$('vImg').onclick = () => $('vImg').classList.toggle('zoom');
+$('vNew').onclick = () => { $('viewer').classList.remove('show'); wantViewer = true; caption('Neues Foto …'); send(lastShotCmd, 'tile'); };
+
+// PC an / Sperren / Aus: Knopf leuchtet 3 Sekunden mit "Abbrechen", dann passiert es. Nochmal tippen = abbrechen.
+// Immer nur EIN Knopf scharf. Nach dem Auslösen 4 Sekunden gesperrt (später Abbrechen-Tipp löst nichts Neues aus).
+const armed = [];
+function armButton(id, label, action) {
+  const b = $(id), span = b.querySelector('span'); let t = null, left = 0, lockedUntil = 0;
+  const ctl = { reset: () => { clearInterval(t); t = null; b.classList.remove('arm'); span.textContent = label; }, active: () => !!t };
+  armed.push(ctl);
+  b.onclick = () => {
+    haptic();
+    if (t) { ctl.reset(); caption('Abgebrochen.'); return; }
+    if (Date.now() < lockedUntil) { caption('Schon gesendet.'); return; }
+    armed.forEach(o => { if (o !== ctl && o.active()) o.reset(); });   // anderen Knopf abbrechen
+    left = 3; b.classList.add('arm'); span.textContent = 'Abbrechen ' + left;
+    t = setInterval(() => {
+      left--;
+      if (left > 0) { span.textContent = 'Abbrechen ' + left; haptic(); return; }
+      ctl.reset(); lockedUntil = Date.now() + 4000; span.textContent = 'Gesendet';
+      setTimeout(() => { if (!t) span.textContent = label; }, 2500);
+      action();
+    }, 1000);
+  };
+}
+armButton('pcOn', 'PC an', () => {
+  if (!mac) { caption('Ich kenne die Adresse vom PC noch nicht. Einmal verbinden, solange er an ist.'); return; }
+  caption('Weckruf gesendet … (geht nur im WLAN zu Hause)'); N.wake(mac);
+});
+armButton('pcLock', 'Sperren', () => send('sperren', 'tile'));
+armButton('pcOff', 'Aus', () => send('herunterfahren', 'tile'));
+window.onJarvisWake = ok => { if (!ok) caption('Weckruf ging nicht raus.'); else setTimeout(() => pingPc(), 25000); };
+document.querySelectorAll('[data-cmd]').forEach(b => b.addEventListener('click', () => { haptic(); send(b.dataset.cmd, 'tile'); }));
+
+// ---------- Senden ----------
+function pingPc() {
+  N.send('ping', '');
+  clearTimeout(pcTimer);
+  pcTimer = setTimeout(() => setStatus('PC antwortet nicht. Ist er an?', 'off'), 12000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pingPc(); });
+
+const input = $('input');
+input.addEventListener('input', () => { $('send').disabled = !input.value.trim(); input.style.height = 'auto'; input.style.height = input.scrollHeight + 'px'; });
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendInput(); } });
+$('send').onclick = sendInput;
+function sendInput() { const t = input.value.trim(); if (!t) return; input.value = ''; input.style.height = 'auto'; $('send').disabled = true; send(t, 'text'); }
+function send(t, how) {
+  viaVoice = how === 'voice';
+  add('u', t);
+  if (how === 'tile') caption('…');
+  setStatus('Gesendet', 'busy');
+  N.send('cmd', t);
+}
+
+// Lange auf "Jarvis" drücken = neu koppeln
+let lp; $('title').addEventListener('touchstart', () => { lp = setTimeout(() => N.unpair(), 1200); });
+$('title').addEventListener('touchend', () => clearTimeout(lp));
+
+pingPc();
+</script>
+</body>
+</html>
